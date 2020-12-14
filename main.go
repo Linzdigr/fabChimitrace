@@ -1,9 +1,3 @@
-/*
-Copyright 2020 IBM All Rights Reserved.
-
-SPDX-License-Identifier: Apache-2.0
-*/
-
 package main
 
 import (
@@ -44,11 +38,15 @@ func main() {
 
 	router := mux.NewRouter()
 
+	/* Middleware */
 	router.Use(middleware.JwtAuthentication)
 	router.Use(middleware.FillContract(contract))
 
+	/* Routes */
 	router.HandleFunc(conf.API_BASE_URL+"/parcel/{uuid}", controllers.GetParcel).Methods("GET")
+	router.HandleFunc(conf.API_BASE_URL+"/parcel", controllers.GetAllParcels).Methods("GET")
 	router.HandleFunc(conf.API_BASE_URL+"/parcel/{uuid}", controllers.WidthDrawParcel).Methods("PUT")
+	router.HandleFunc(conf.API_BASE_URL+"/parcel", controllers.CreateParcel).Methods("POST")
 
 	srv := &http.Server{
 		Addr: "0.0.0.0:8080",
