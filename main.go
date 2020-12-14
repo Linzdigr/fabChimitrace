@@ -7,13 +7,23 @@ SPDX-License-Identifier: Apache-2.0
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"time"
 
-	"github.com/google/uuid"
+	"fab-chimix/application-go/conf"
+	"fab-chimix/application-go/controllers"
+	"fab-chimix/application-go/middleware"
+	"fab-chimix/application-go/utils"
+
+	"github.com/gorilla/mux"
 	"github.com/hyperledger/fabric-sdk-go/pkg/core/config"
 	"github.com/hyperledger/fabric-sdk-go/pkg/gateway"
 )
@@ -21,104 +31,63 @@ import (
 func main() {
 	log.Println("============ application-golang starts ============")
 
-	err := os.Setenv("DISCOVERY_AS_LOCALHOST", "true")
+	var wait time.Duration
+	flag.DurationVar(&wait, "graceful-timeout", time.Second*15, "the duration for which the server gracefully wait for existing connections to finish - e.g. 15s or 1m")
+	flag.Parse()
+
+	contract, err := initContract()
+
 	if err != nil {
-		log.Fatalf("Error setting DISCOVERY_AS_LOCALHOST environemnt variable: %v", err)
+		log.Fatalf("Failed to init contract client: %v", err)
+		return
 	}
 
-	wallet, err := gateway.NewFileSystemWallet("wallet")
-	if err != nil {
-		log.Fatalf("Failed to create wallet: %v", err)
+	router := mux.NewRouter()
+
+	router.Use(middleware.JwtAuthentication)
+	router.Use(middleware.FillContract(contract))
+
+	router.HandleFunc(conf.API_BASE_URL+"/parcel/{uuid}", controllers.GetParcel).Methods("GET")
+	router.HandleFunc(conf.API_BASE_URL+"/parcel/{uuid}", controllers.WidthDrawParcel).Methods("PUT")
+
+	srv := &http.Server{
+		Addr: "0.0.0.0:8080",
+		// Good practice to set timeouts to avoid Slowloris attacks.
+		WriteTimeout: time.Second * 15,
+		ReadTimeout:  time.Second * 15,
+		IdleTimeout:  time.Second * 60,
+		Handler:      router,
 	}
 
-	if !wallet.Exists("appUser") {
-		err = populateWallet(wallet)
-		if err != nil {
-			log.Fatalf("Failed to populate wallet contents: %v", err)
+	// Run our server in a goroutine so that it doesn't block.
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			utils.ErrorLog("Error launching HTTP server", err)
+		} else {
+			log.Println("============ server started ============")
+			log.Printf("Listening on %v", srv.Addr)
 		}
-	}
+	}()
 
-	ccpPath := filepath.Join(
-		"..",
-		"organizations",
-		"peerOrganizations",
-		"org1.example.com",
-		"connection-org1.yaml",
-	)
+	c := make(chan os.Signal, 1)
+	// We'll accept graceful shutdowns when quit via SIGINT (Ctrl+C)
+	// SIGKILL, SIGQUIT or SIGTERM (Ctrl+/) will not be caught.
+	signal.Notify(c, os.Interrupt)
 
-	gw, err := gateway.Connect(
-		gateway.WithConfig(config.FromFile(filepath.Clean(ccpPath))),
-		gateway.WithIdentity(wallet, "appUser"),
-	)
-	if err != nil {
-		log.Fatalf("Failed to connect to gateway: %v", err)
-	}
-	defer gw.Close()
+	// Block until we receive our signal.
+	<-c
 
-	network, err := gw.GetNetwork("chimitrace-channel")
-	if err != nil {
-		log.Fatalf("Failed to get network: %v", err)
-	}
-
-	contract := network.GetContract("chimitrace")
-
-	log.Println("--> Submit Transaction: InitLedger, function creates the initial set of assets on the ledger")
-	result, err := contract.SubmitTransaction("InitLedger")
-	if err != nil {
-		log.Fatalf("Failed to Submit transaction: %v", err)
-	}
-	log.Println(string(result))
-
-	transacUUID := uuid.New().String()
-
-	log.Printf("--> Submit Transaction: CreateAsset, creates new asset with ID (%s), color, owner, size, and appraisedValue arguments\n", transacUUID)
-	result, err = contract.SubmitTransaction("CreateAsset", transacUUID, "T", "5", "15", "300", "true", "3")
-	if err != nil {
-		log.Fatalf("Failed to Submit transaction: %v", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Evaluate Transaction: ReadAsset, function returns an asset with a given assetID")
-	result, err = contract.EvaluateTransaction("ReadAsset", transacUUID)
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v\n", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Submit Transaction: WithDrawAsset, updates 'a1da243e-42c6-4c2d-86fe-5c44d79ea20d' attributes")
-	result, err = contract.SubmitTransaction("WithDrawAsset", "a1da243e-42c6-4c2d-86fe-5c44d79ea20d", "3")
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Evaluate Transaction: ReadAsset, function returns an asset with a given assetID")
-	result, err = contract.EvaluateTransaction("ReadAsset", "a1da243e-42c6-4c2d-86fe-5c44d79ea20d")
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v\n", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Evaluate Transaction: AssetExists, function returns 'true' if an asset with given assetID exist")
-	result, err = contract.EvaluateTransaction("AssetExists", "65fbb875-7f0d-4cf3-824c-d8b8977c7983")
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v\n", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Evaluate Transaction: WithDrawAsset, function returns 'a1da243e-42c6-4c2d-86fe-5c44d79ea20d' attributes")
-	result, err = contract.EvaluateTransaction("WithDrawAsset", "a1da243e-42c6-4c2d-86fe-5c44d79ea20d", "5")
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v", err)
-	}
-	log.Println(string(result))
-
-	log.Println("--> Evaluate Transaction: GetAllAssets, function returns all the current assets on the ledger")
-	result, err = contract.EvaluateTransaction("GetAllAssets")
-	if err != nil {
-		log.Fatalf("Failed to evaluate transaction: %v", err)
-	}
-	log.Println(string(result))
+	// Create a deadline to wait for.
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	// Doesn't block if no connections, but will otherwise wait
+	// until the timeout deadline.
+	srv.Shutdown(ctx)
+	// Optionally, you could run srv.Shutdown in a goroutine and block on
+	// <-ctx.Done() if your application should wait for other services
+	// to finalize based on context cancellation.
+	log.Println("shutting down")
+	os.Exit(0)
 
 	log.Println("============ application-golang ends ============")
 }
@@ -160,4 +129,52 @@ func populateWallet(wallet *gateway.Wallet) error {
 	identity := gateway.NewX509Identity("Org1MSP", string(cert), string(key))
 
 	return wallet.Put("appUser", identity)
+}
+
+func initContract() (*gateway.Contract, error) {
+	err := os.Setenv("DISCOVERY_AS_LOCALHOST", "true")
+	if err != nil {
+		log.Fatalf("Error setting DISCOVERY_AS_LOCALHOST environemnt variable: %v", err)
+		return nil, err
+	}
+
+	wallet, err := gateway.NewFileSystemWallet("wallet")
+	if err != nil {
+		log.Fatalf("Failed to create wallet: %v", err)
+		return nil, err
+	}
+
+	if !wallet.Exists("appUser") {
+		err = populateWallet(wallet)
+		if err != nil {
+			log.Fatalf("Failed to populate wallet contents: %v", err)
+			return nil, err
+		}
+	}
+
+	ccpPath := filepath.Join(
+		"..",
+		"organizations",
+		"peerOrganizations",
+		"org1.example.com",
+		"connection-org1.yaml",
+	)
+
+	gw, err := gateway.Connect(
+		gateway.WithConfig(config.FromFile(filepath.Clean(ccpPath))),
+		gateway.WithIdentity(wallet, "appUser"),
+	)
+	if err != nil {
+		log.Fatalf("Failed to connect to gateway: %v", err)
+		return nil, err
+	}
+	defer gw.Close()
+
+	network, err := gw.GetNetwork("chimitrace-channel")
+	if err != nil {
+		log.Fatalf("Failed to get network: %v", err)
+		return nil, err
+	}
+
+	return network.GetContract("chimitrace"), nil
 }
